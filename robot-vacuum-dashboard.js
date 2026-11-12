@@ -257,6 +257,12 @@ const RVD_TRANSLATIONS = {
   },
 };
 
+const RVD_MAPPING_TEXT = {
+  en: {mapping_device:"The {role} entity belongs to another device. Check its mapping.",mapping_ambiguous:"Choose an explicit {role} entity. More than one candidate matches."},
+  nl: {mapping_device:"De entiteit voor {role} hoort bij een ander apparaat. Controleer de koppeling.",mapping_ambiguous:"Kies een expliciete entiteit voor {role}. Er zijn meerdere kandidaten."}
+};
+for (const [language,table] of Object.entries(RVD_TRANSLATIONS)) Object.assign(table,RVD_MAPPING_TEXT[language] || RVD_MAPPING_TEXT.en);
+
 // Picks the card language: explicit `language` option, then the Home Assistant
 // profile language, then the browser. Unknown languages fall back to English.
 const rvdLanguage = (hass, override) => {
@@ -366,12 +372,21 @@ const rvdCollectionText = (key, items) => (Array.isArray(items) ? items : [])
   .join("\n");
 
 let rvdSharedSheet = null;
+let rvdCardSequence = 0;
 
 class RobotVacuumDashboardCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
     this._tab = "overview";
+    this._cardId = `rvd-${++rvdCardSequence}`;
+    this._mapAttempts = new Map();
+    this._mapEpoch = 0;
+    this._mapActive = null;
+    this._mapRetryTimer = null;
+    this._pendingFocusToken = null;
+    this._selectionIdentity = null;
+    this._mappingErrors = {};
     this._cleanMode = "auto";
     this._selectedAreas = new Set();
     this._selectedRegion = null;
@@ -387,7 +402,11 @@ class RobotVacuumDashboardCard extends HTMLElement {
     this._adoptStyles();
   }
 
+  connectedCallback() { this._queueRender(); }
+  disconnectedCallback() { this._cancelMapWork(); }
+
   setConfig(config) {
+    this._cancelMapWork();
     if (!config?.entity || !String(config.entity).startsWith("vacuum.")) {
       throw new Error(rvdTranslate(rvdLanguage(this._hass, config?.language), "error_invalid_entity"));
     }
@@ -404,6 +423,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
     };
     this._entityCache = null;
     this._renderSignature = null;
+    this._syncSelectionIdentity();
     if (this._areaMapping?.entity !== this.config.entity) this._areaMapping = null;
     this._queueRender();
   }
@@ -412,6 +432,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
     const previous = this._hass;
     this._hass = hass;
     if (previous?.entities !== hass?.entities) this._areaMapping = null;
+    if (this.config) this._syncSelectionIdentity();
     if (this.config && this._signatureChanged()) this._queueRender();
   }
 
@@ -458,7 +479,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
     const hass = this._hass;
     if (!hass) return false;
     const resolved = this._resolveEntities();
-    const ids = [this.config.entity, ...Object.values(resolved).filter(Boolean)];
+    const ids = [...new Set([this.config.entity, ...Object.values(resolved).filter(Boolean), ...(this._tab === "details" ? this._detailStates().map(([id]) => id) : [])])];
     const signature = [
       hass.entities, hass.devices, hass.areas, hass.locale, hass.language,
       ...ids.map((id) => hass.states?.[id]),
@@ -473,7 +494,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
     this._renderQueued = true;
     queueMicrotask(() => {
       this._renderQueued = false;
-      if (this.config && this._hass) this._render();
+      if (this.isConnected && this.config && this._hass) this._render();
     });
   }
 
@@ -489,71 +510,69 @@ class RobotVacuumDashboardCard extends HTMLElement {
     return this._registryEntry(this.config.entity)?.device_id || null;
   }
 
-  _relatedStates() {
-    const root = this._root().toLowerCase();
-    const rootWords = root.split("_").filter((word) => word.length > 2);
-    return Object.entries(this._hass.states).filter(([id, state]) => {
-      if (id === this.config.entity) return true;
-      const haystack = `${id} ${state.attributes?.friendly_name || ""}`.toLowerCase();
-      return haystack.includes(root) || rootWords.filter((word) => haystack.includes(word)).length >= Math.min(2, rootWords.length);
-    });
+  _ownedDeviceIds() {
+    const id = this._vacuumDeviceId();
+    if (!id) return new Set();
+    const devices = this._hass.devices || {};
+    const identifiers = value => (Array.isArray(value?.identifiers) ? value.identifiers : [])
+      .filter(pair => Array.isArray(pair) && pair.length === 2 && pair.every(part => typeof part === "string" && part.length > 0)).map(pair => JSON.stringify(pair));
+    const own = new Set(identifiers(devices[id]));
+    return new Set([id, ...Object.entries(devices).filter(([,device]) => identifiers(device).some(key => own.has(key))).map(([key]) => key)]);
   }
-
-  // Resolves every role (map, statistics, consumables, switches) to an entity once per
-  // registry or entity-list change. Order: explicit config, then the vacuum's own device
-  // by translation key, then the name heuristic for integrations without a registry match.
+  _relatedStates() {
+    const ids = this._ownedDeviceIds();
+    return Object.entries(this._hass.states).filter(([id]) => id === this.config.entity || ids.has(this._registryEntry(id)?.device_id));
+  }
   _resolveEntities() {
     const hass = this._hass;
     if (!hass || !this.config) return {};
-    const stateCount = Object.keys(hass.states || {}).length;
+    const stateIds = Object.keys(hass.states || {}).sort().join("\0");
+    const registrySignature=JSON.stringify([Object.entries(hass.entities || {}).map(([id,entry])=>[id,entry.device_id,entry.translation_key]),Object.entries(hass.devices || {}).map(([id,device])=>[id,device.identifiers])]);
     const cache = this._entityCache;
-    if (cache && cache.entities === hass.entities && cache.stateCount === stateCount && cache.config === this.config) return cache.resolved;
-
-    const registry = hass.entities || {};
-    const deviceId = this._vacuumDeviceId();
-    const deviceEntries = deviceId ? Object.values(registry).filter((entry) => entry.device_id === deviceId) : [];
-    const resolved = {};
-    for (const [key, rule] of Object.entries(RVD_ENTITY_RULES)) {
+    if (cache && cache.entities === hass.entities && cache.devices === hass.devices && cache.stateIds === stateIds && cache.registrySignature === registrySignature && cache.config === this.config) return cache.resolved;
+    const owned = this._ownedDeviceIds();
+    const entries = Object.entries(hass.entities || {}).map(([entity_id,entry]) => ({...entry,entity_id:entry.entity_id || entity_id})).filter(entry => owned.has(entry.device_id));
+    const resolved = {}; this._mappingErrors = {};
+    for (const [key,rule] of Object.entries(RVD_ENTITY_RULES)) {
       const configured = this.config.entities?.[key];
-      if (configured && hass.states[configured]) {
-        resolved[key] = configured;
+      if (configured !== undefined && configured !== null && configured !== "") {
+        const device = this._registryEntry(configured)?.device_id;
+        if (typeof configured !== "string" || !hass.states[configured] || !rule.domains.includes(configured.split(".")[0])) {
+          resolved[key] = null; this._mappingErrors[key] = this._t("entity_not_found", {entity: typeof configured === "string" ? configured : key});
+        } else if (this._vacuumDeviceId() && device && !owned.has(device)) {
+          resolved[key] = null; this._mappingErrors[key] = this._t("mapping_device",{role:key});
+        } else resolved[key] = configured;
         continue;
       }
-      const candidates = [...deviceEntries];
-      if (rule.platforms) {
-        candidates.push(...Object.values(registry).filter((entry) => rule.platforms.includes(entry.platform) && !candidates.includes(entry)));
-      }
-      const byKey = rule.translationKeys
-        .map((translationKey) => candidates.find((entry) =>
-          entry.translation_key === translationKey &&
-          rule.domains.includes(entry.entity_id.split(".")[0]) &&
-          hass.states[entry.entity_id]))
-        .find(Boolean);
-      resolved[key] = byKey?.entity_id || this._entityByName(key);
+      const matches = [...new Set(entries.filter(entry => rule.translationKeys.includes(entry.translation_key) && rule.domains.includes(entry.entity_id.split(".")[0]) && hass.states[entry.entity_id]).map(entry => entry.entity_id))];
+      if (matches.length > 1) { resolved[key] = null; this._mappingErrors[key] = this._t("mapping_ambiguous",{role:key}); }
+      else resolved[key] = matches[0] || this._entityByName(key);
     }
-    this._entityCache = { entities: hass.entities, stateCount, config: this.config, resolved };
+    this._entityCache = {entities:hass.entities, devices:hass.devices, stateIds, registrySignature, config:this.config, resolved};
     return resolved;
   }
-
   _entityByName(key) {
     const rule = RVD_ENTITY_RULES[key];
     if (!rule) return null;
-    const relatedCandidates = this._relatedStates().filter(([id]) => rule.domains.includes(id.split(".")[0]));
-    const geometryCandidates = key === "map_geometry"
-      ? Object.entries(this._hass.states).filter(([id, state]) =>
-        id.startsWith("sensor.") && [1, 2].includes(Number(state.attributes?.schema_version)) && Array.isArray(state.attributes?.rooms)
-      )
-      : [];
-    const candidates = [...relatedCandidates, ...geometryCandidates.filter(([id]) => !relatedCandidates.some(([relatedId]) => relatedId === id))];
-    let best = null;
-    let bestScore = 0;
-    for (const [id, state] of candidates) {
+    const candidates = this._relatedStates().filter(([id]) => rule.domains.includes(id.split(".")[0]));
+    let best = []; let bestScore = 0;
+    for (const [id,state] of candidates) {
       const haystack = `${id} ${state.attributes?.friendly_name || ""}`.toLowerCase();
-      const score = rule.terms.reduce((total, term, index) => total + (haystack.includes(term) ? 20 - index : 0), 0);
-      if (score > bestScore) { best = id; bestScore = score; }
+      const geometry = key === "map_geometry" && [1,2].includes(Number(state.attributes?.schema_version)) && Array.isArray(state.attributes?.rooms);
+      const score = Math.max(geometry ? 1 : 0,rule.terms.reduce((sum,term,index) => sum + (haystack.includes(term) ? 20-index : 0),0));
+      if (score > bestScore) { best=[id]; bestScore=score; } else if (score && score === bestScore) best.push(id);
     }
-    return best;
+    if (best.length > 1) this._mappingErrors[key] = this._t("mapping_ambiguous",{role:key});
+    return best.length === 1 ? best[0] : null;
   }
+  _syncSelectionIdentity() {
+    if (!this.config || !this._hass) return;
+    const resolved = this._resolveEntities();
+    const geometry = this._hass.states[resolved.map_geometry]?.attributes;
+    const identity = JSON.stringify([this.config.entity,this._vacuumDeviceId(),resolved.map,resolved.map_geometry,geometry?.map_id,geometry?.floor_id,(Array.isArray(geometry?.rooms) ? geometry.rooms : []).map(room => [room.id,room.name,room.coordinates])]);
+    if (this._selectionIdentity !== identity) { this._selectedAreas.clear(); this._selectedRegion=null; this._areaMapping=null; this._areaMappingLoading=null; this._cancelMapWork(); this._selectionIdentity=identity; }
+  }
+  _bindingContext() { return JSON.stringify([this._selectionIdentity,this.config.entity,this._resolveEntities()]); }
 
   _entity(key) {
     return this._resolveEntities()[key] || null;
@@ -616,24 +635,49 @@ class RobotVacuumDashboardCard extends HTMLElement {
     return `${url}${url.includes("?") ? "&" : "?"}rvd=${encodeURIComponent(revision)}`;
   }
 
+  _cancelMapWork() {
+    this._mapEpoch = (this._mapEpoch || 0) + 1;
+    if (this._mapActive) { this._mapActive.controller.abort(); this._mapActive.rejectTimeout?.(new Error("Map request cancelled")); this._mapAttempts?.delete(this._mapActive.key); }
+    this._mapActive = null; clearTimeout(this._mapRetryTimer); this._mapRetryTimer=null; this._mapMetadata=null;
+  }
+  _scheduleMapRetry(key,delay) {
+    if (this._mapRetryTimer || !this.isConnected) return;
+    const epoch=this._mapEpoch;
+    this._mapRetryTimer=setTimeout(() => { this._mapRetryTimer=null; if (epoch!==this._mapEpoch || !this.isConnected) return; const attempt=this._mapAttempts.get(key); if(attempt)attempt.readyRetry=true; this._queueRender(); },delay);
+    this._mapRetryTimer?.unref?.();
+  }
+  async _readMapText(response,signal) {
+    const limit=2_097_152;
+    if (Number(response.headers?.get("content-length")) > limit) throw new Error("Map response exceeds the size limit");
+    if (!response.body?.getReader) { const text=await response.text(); if(new TextEncoder().encode(text).length>limit)throw new Error("Map response exceeds the size limit");return text; }
+    const reader=response.body.getReader();const decoder=new TextDecoder();let size=0,text="";
+    try { while(true) { if(signal.aborted)throw new Error("Map request cancelled");const chunk=await reader.read();if(chunk.done)break;size+=chunk.value.byteLength;if(size>limit)throw new Error("Map response exceeds the size limit");text+=decoder.decode(chunk.value,{stream:true}); }return text+decoder.decode(); }
+    finally { await reader.cancel().catch(()=>{}); }
+  }
   _ensureMapMetadata(state) {
-    const revision = state?.state || state?.last_updated;
-    if (!state || !revision || this._mapMetadata?.revision === revision || this._mapMetadataLoading === revision) return;
-    this._mapMetadataLoading = revision;
-    fetch(this._entityPictureUrl(state), { credentials: "same-origin" })
-      .then((response) => response.ok ? response.text() : Promise.reject(new Error(`Map request failed (${response.status})`)))
-      .then((source) => {
-        if (this._mapMetadataLoading !== revision) return;
-        const parsed = this._sanitizeMapSvg(source);
-        if (parsed) this._mapMetadata = { revision, ...parsed };
-      })
-      .catch(() => {
-        if (this._mapMetadataLoading === revision && !this._mapMetadata) this._mapMetadata = null;
-      })
-      .finally(() => {
-        if (this._mapMetadataLoading === revision) this._mapMetadataLoading = null;
-        this._queueRender();
-      });
+    if (!this.isConnected || !this.config.show_map || this.config.map_render_mode === "image") return;
+    const revision=state?.state || state?.last_updated;const url=this._entityPictureUrl(state);
+    if (!state || !revision || !url) return;
+    const key=JSON.stringify([state.entity_id,url,revision]);
+    if(this._mapActive && this._mapActive.key!==key)this._cancelMapWork();
+    const cached=this._mapAttempts.get(key);
+    if(this._mapMetadata?.key!==key)this._mapMetadata=null;
+    if(cached?.status==="success"){this._mapMetadata=cached.metadata;return;}
+    if(cached?.status==="raster" || cached?.status==="pending" || cached?.count>=3)return;
+    if(cached?.status==="failed"&&!cached.readyRetry){this._scheduleMapRetry(key,cached.count*5000);return;}
+    const attempt={count:(cached?.count||0)+1,status:"pending"};this._mapAttempts.set(key,attempt);
+    while(this._mapAttempts.size>8)this._mapAttempts.delete(this._mapAttempts.keys().next().value);
+    const request={key,epoch:this._mapEpoch,controller:new AbortController()};this._mapActive=request;
+    const timeout=new Promise((_,reject)=>{request.rejectTimeout=reject;request.timer=setTimeout(()=>{request.controller.abort();reject(new Error("Map request timed out"));},5000);request.timer?.unref?.();});
+    const work=fetch(url,{credentials:"same-origin",signal:request.controller.signal}).then(async response=>{
+      if(!response.ok)throw new Error("Map request failed");
+      if(/^image\/(?:png|jpeg|webp|gif)/i.test(response.headers?.get("content-type")||""))return {raster:true};
+      const source=await this._readMapText(response,request.controller.signal);if(request.controller.signal.aborted)throw new Error("Map request cancelled");
+      const parsed=this._sanitizeMapSvg(source);if(!parsed)throw new Error("Map SVG is invalid");return parsed;
+    });
+    Promise.race([work,timeout]).then(parsed=>{if(this._mapActive!==request||request.epoch!==this._mapEpoch)return;if(parsed.raster)attempt.status="raster";else{attempt.status="success";attempt.metadata={key,revision,...parsed};this._mapMetadata=attempt.metadata;}})
+      .catch(()=>{if(this._mapActive===request&&request.epoch===this._mapEpoch)attempt.status="failed";})
+      .finally(()=>{clearTimeout(request.timer);if(this._mapActive!==request||request.epoch!==this._mapEpoch)return;this._mapActive=null;this._queueRender();});
   }
 
   _sanitizeMapSvg(source) {
@@ -697,15 +741,18 @@ class RobotVacuumDashboardCard extends HTMLElement {
   _areaMappingFor() {
     const entityId = this.config.entity;
     if (this._areaMapping?.entity === entityId) return this._areaMapping.mapping;
-    if (this._areaMappingLoading === entityId || typeof this._hass.callWS !== "function") return null;
-    this._areaMappingLoading = entityId;
+    if (this._areaMappingLoading?.entityId === entityId || typeof this._hass.callWS !== "function") return null;
+    const request = { entityId, identity: this._selectionIdentity };
+    this._areaMappingLoading = request;
     this._hass.callWS({ type: "config/entity_registry/get", entity_id: entityId })
       .then((entry) => {
+        if (this._areaMappingLoading !== request || request.identity !== this._selectionIdentity) return;
         const mapping = entry?.options?.vacuum?.area_mapping;
         this._areaMapping = { entity: entityId, mapping: mapping && typeof mapping === "object" ? mapping : null };
       })
-      .catch(() => { this._areaMapping = { entity: entityId, mapping: null }; })
+      .catch(() => { if (this._areaMappingLoading === request && request.identity === this._selectionIdentity) this._areaMapping = { entity: entityId, mapping: null }; })
       .finally(() => {
+        if (this._areaMappingLoading !== request) return;
         this._areaMappingLoading = null;
         this._queueRender();
       });
@@ -853,7 +900,19 @@ class RobotVacuumDashboardCard extends HTMLElement {
     return active && ["SELECT", "INPUT", "TEXTAREA"].includes(active.tagName) ? active : null;
   }
 
+  _focusToken(element) {
+    if(!element)return null;
+    const keys=["data-tab","data-service","data-toggle","data-more-info","data-clean-mode","data-area-id","data-map-area-id","data-region-index","data-clean-start","data-control","data-entity"];
+    const values=keys.filter(key=>element.hasAttribute(key)).map(key=>[key,element.getAttribute(key)]);
+    return values.length ? JSON.stringify(values) : null;
+  }
+  _restoreFocus(token) {
+    if(!token)return;
+    const target=[...this.shadowRoot.querySelectorAll("button,a,input,select,textarea,[tabindex]")].find(element=>this._focusToken(element)===token);
+    (target || this.shadowRoot.querySelector('[role="tab"][aria-selected="true"]'))?.focus({preventScroll:true});
+  }
   _render() {
+    const focusToken=this._pendingFocusToken || this._focusToken(this.shadowRoot.activeElement);this._pendingFocusToken=null;
     const focused = this._focusedFormControl();
     if (focused) {
       if (!this._renderDeferred) {
@@ -876,12 +935,13 @@ class RobotVacuumDashboardCard extends HTMLElement {
       ${this._styleMarkup}
       <ha-card>
         ${this._header(vacuum)}
+        ${Object.values(this._mappingErrors).map(message=>`<div class="alert" role="alert">${rvdEscape(message)}</div>`).join("")}
         <nav role="tablist" aria-label="${rvdEscape(this._t("sections"))}">
           ${this._navButton("overview", this._t("tab_overview"))}
           ${this._navButton("details", this._t("tab_details"))}
           ${this._navButton("settings", this._t("tab_settings"))}
         </nav>
-        <main role="tabpanel">${this._tab === "overview" ? this._overview(vacuum) : this._tab === "details" ? this._details() : this._settings()}</main>
+        <main role="tabpanel" id="${this._cardId}-panel" aria-labelledby="${this._cardId}-tab-${this._tab}" tabindex="0">${this._tab === "overview" ? this._overview(vacuum) : this._tab === "details" ? this._details() : this._settings()}</main>
         <footer>Robot Vacuum Dashboard · v${ROBOT_VACUUM_DASHBOARD_VERSION}</footer>
       </ha-card>`;
     const nextMapImage = this.shadowRoot.querySelector(".map-visual .map");
@@ -897,6 +957,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
       nextNativeMap.replaceWith(existingNativeMap);
     }
     this._bindEvents();
+    this._restoreFocus(focusToken);
   }
 
   _preloadMapSource(source) {
@@ -938,12 +999,12 @@ class RobotVacuumDashboardCard extends HTMLElement {
 
   _navButton(tab, label) {
     const active = this._tab === tab;
-    return `<button class="nav-button ${active ? "active" : ""}" role="tab" aria-selected="${active}" data-tab="${tab}">${rvdEscape(label)}</button>`;
+    return `<button class="nav-button ${active ? "active" : ""}" role="tab" id="${this._cardId}-tab-${tab}" aria-controls="${this._cardId}-panel" aria-selected="${active}" tabindex="${active?0:-1}" data-tab="${tab}">${rvdEscape(label)}</button>`;
   }
 
   _overview(vacuum) {
     const map = this._state("map");
-    this._ensureMapMetadata(map);
+    if(this.config.show_map && this.config.map_render_mode!=="image")this._ensureMapMetadata(map);
     const mapUrl = this._entityPictureUrl(map);
     const nativeMap = this._nativeMapMarkup(vacuum);
     const roomOverlay = nativeMap ? "" : this._roomOverlay(vacuum);
@@ -1002,8 +1063,8 @@ class RobotVacuumDashboardCard extends HTMLElement {
         : `<p class="target-help">${rvdEscape(this._t("auto_help"))}</p>`;
     const disabled = (this._cleanMode === "area" && !this._selectedAreas.size) || (this._cleanMode === "custom" && this._selectedRegion === null);
     const actionLabel = this._cleanMode === "area" ? this._t("clean_selected_rooms") : this._cleanMode === "custom" ? this._t("clean_selected_zone") : this._t("start_full_clean");
-    const modeTab = (mode, label) => `<button class="${this._cleanMode === mode ? "active" : ""}" role="tab" aria-selected="${this._cleanMode === mode}" data-clean-mode="${mode}">${rvdEscape(label)}</button>`;
-    return `<div class="cleaning-console"><div class="mode-tabs" role="tablist" aria-label="${rvdEscape(this._t("cleaning_modes"))}">${modeTab("area", this._t("mode_area"))}${modeTab("auto", this._t("mode_auto"))}${modeTab("custom", this._t("mode_custom"))}</div><div class="target-content">${modeContent}</div><div class="clean-action"><button class="clean-start" data-clean-start ${disabled ? "disabled" : ""} title="${rvdEscape(actionLabel)}" aria-label="${rvdEscape(actionLabel)}"><ha-icon icon="mdi:robot-vacuum"></ha-icon></button><span aria-hidden="true">${rvdEscape(actionLabel)}</span></div></div>`;
+    const modeTab = (mode, label) => `<button class="${this._cleanMode === mode ? "active" : ""}" role="tab" id="${this._cardId}-mode-${mode}" aria-controls="${this._cardId}-mode-panel" tabindex="${this._cleanMode === mode ? 0 : -1}" aria-selected="${this._cleanMode === mode}" data-clean-mode="${mode}">${rvdEscape(label)}</button>`;
+    return `<div class="cleaning-console"><div class="mode-tabs" role="tablist" aria-label="${rvdEscape(this._t("cleaning_modes"))}">${modeTab("area", this._t("mode_area"))}${modeTab("auto", this._t("mode_auto"))}${modeTab("custom", this._t("mode_custom"))}</div><div class="target-content" role="tabpanel" id="${this._cardId}-mode-panel" aria-labelledby="${this._cardId}-mode-${this._cleanMode}">${modeContent}</div><div class="clean-action"><button class="clean-start" data-clean-start ${disabled ? "disabled" : ""} title="${rvdEscape(actionLabel)}" aria-label="${rvdEscape(actionLabel)}"><ha-icon icon="mdi:robot-vacuum"></ha-icon></button><span aria-hidden="true">${rvdEscape(actionLabel)}</span></div></div>`;
   }
 
   _notify(message) {
@@ -1086,17 +1147,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
 
   // Entities shown on the "All data" tab: the vacuum's own device when the entity
   // registry is available, otherwise the name-based guess.
-  _detailStates() {
-    const deviceId = this._vacuumDeviceId();
-    if (!deviceId) return this._relatedStates();
-    const ids = new Set(Object.values(this._hass.entities)
-      .filter((entry) => entry.device_id === deviceId && !entry.hidden)
-      .map((entry) => entry.entity_id));
-    ids.add(this.config.entity);
-    const geometry = this._entity("map_geometry");
-    if (geometry) ids.add(geometry);
-    return [...ids].filter((id) => this._hass.states[id]).map((id) => [id, this._hass.states[id]]);
-  }
+  _detailStates() { return this._relatedStates(); }
 
   _details() {
     const states = this._detailStates().sort(([a], [b]) => a.localeCompare(b));
@@ -1144,18 +1195,27 @@ class RobotVacuumDashboardCard extends HTMLElement {
 
   _bindEvents() {
     const all = (selector) => this.shadowRoot.querySelectorAll(selector);
-    all("[data-tab]").forEach((button) => button.addEventListener("click", () => { this._tab = button.dataset.tab; this._render(); }));
+    const binding=this._bindingContext();
+    if(this._controlGuard)for(const type of ["click","change","keydown"])this.shadowRoot.removeEventListener(type,this._controlGuard,true);
+    this._controlGuard=event=>{if(binding===this._bindingContext())return;event.preventDefault();event.stopImmediatePropagation();this._focusedFormControl()?.blur();this._queueRender();};
+    for(const type of ["click","change","keydown"])this.shadowRoot.addEventListener(type,this._controlGuard,true);
+    const tabs=[...all("[data-tab]")];
+    const activate=button=>{this._tab=button.dataset.tab;this._pendingFocusToken=this._focusToken(button);this._render();};
+    tabs.forEach((button,index)=>{button.addEventListener("click",()=>activate(button));button.addEventListener("keydown",event=>{const next=event.key==="ArrowRight"?(index+1)%tabs.length:event.key==="ArrowLeft"?(index+tabs.length-1)%tabs.length:event.key==="Home"?0:event.key==="End"?tabs.length-1:null;if(next===null)return;event.preventDefault();activate(tabs[next]);});});
     all("[data-service]").forEach((button) => button.addEventListener("click", () => this._call(button.dataset.service)));
     all("[data-more-info]").forEach((button) => button.addEventListener("click", () => this._moreInfo(button.dataset.moreInfo)));
-    all("[data-clean-mode]").forEach((button) => button.addEventListener("click", () => { this._cleanMode = button.dataset.cleanMode; this._render(); }));
+    const modes=[...all("[data-clean-mode]")];
+    const activateMode=button=>{this._cleanMode=button.dataset.cleanMode;this._pendingFocusToken=this._focusToken(button);this._render();};
+    modes.forEach((button,index)=>{button.addEventListener("click",()=>activateMode(button));button.addEventListener("keydown",event=>{const next=event.key==="ArrowRight"?(index+1)%modes.length:event.key==="ArrowLeft"?(index+modes.length-1)%modes.length:event.key==="Home"?0:event.key==="End"?modes.length-1:null;if(next===null)return;event.preventDefault();activateMode(modes[next]);});});
     all("[data-area-id]").forEach((button) => button.addEventListener("click", () => { const id = button.dataset.areaId; this._selectedAreas.has(id) ? this._selectedAreas.delete(id) : this._selectedAreas.add(id); this._render(); }));
     all("[data-map-area-id]").forEach((shape) => {
-      shape.addEventListener("click", () => this._toggleArea(shape.dataset.mapAreaId));
-      shape.addEventListener("keydown", (event) => {
+      // Native map nodes can survive a render. Replace their handlers instead of stacking them.
+      shape.onclick = () => this._toggleArea(shape.dataset.mapAreaId);
+      shape.onkeydown = (event) => {
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         this._toggleArea(shape.dataset.mapAreaId);
-      });
+      };
     });
     all("[data-region-index]").forEach((button) => button.addEventListener("click", () => { this._selectedRegion = Number(button.dataset.regionIndex); this._render(); }));
     this.shadowRoot.querySelector("[data-clean-start]")?.addEventListener("click", () => this._startTargetedCleaning());
@@ -1173,7 +1233,7 @@ class RobotVacuumDashboardCard extends HTMLElement {
   _styles() {
     return `
       :host{--accent:var(--primary-color,#138d88);--accent-2:#2786c7;--ink:var(--primary-text-color,#17212b);--muted:var(--secondary-text-color,#6c7782);--surface:var(--ha-card-background,var(--card-background-color,#fff));--soft:color-mix(in srgb,var(--accent) 8%,var(--surface));--line:color-mix(in srgb,var(--ink) 10%,transparent);--danger:var(--error-color,#d84b4b);--warning:#e9a23b;display:block}*{box-sizing:border-box}ha-card{overflow:hidden;border-radius:28px;background:var(--surface);color:var(--ink);font-family:var(--paper-font-body1_-_font-family,system-ui,sans-serif)}button,select{font:inherit;color:inherit}.hero{min-height:156px;padding:30px 34px;display:flex;align-items:center;gap:22px;background:radial-gradient(circle at 85% 15%,color-mix(in srgb,var(--accent-2) 20%,transparent),transparent 42%),linear-gradient(135deg,color-mix(in srgb,var(--accent) 16%,var(--surface)),color-mix(in srgb,var(--accent-2) 8%,var(--surface)))}.hero-error{background:linear-gradient(135deg,color-mix(in srgb,var(--danger) 15%,var(--surface)),var(--surface))}.robot{width:82px;height:82px;border-radius:50%;display:grid;place-items:center;background:var(--surface);box-shadow:0 12px 30px color-mix(in srgb,var(--ink) 14%,transparent);border:1px solid var(--line)}.robot ha-icon{--mdc-icon-size:48px;color:var(--accent)}.robot.working{animation:rvdPulse 2s infinite}.hero-copy{min-width:0;flex:1}.eyebrow,.kicker{font-size:10px;letter-spacing:.16em;font-weight:800;color:var(--accent)}h1,h2,p{margin:0}h1{font-size:clamp(25px,4vw,38px);line-height:1.12;margin:5px 0 8px}.hero p{display:flex;align-items:center;gap:8px;color:var(--muted);font-weight:600}.status-dot{width:9px;height:9px;border-radius:50%;background:var(--muted)}.status-dot.cleaning{background:var(--accent);box-shadow:0 0 0 5px color-mix(in srgb,var(--accent) 14%,transparent)}.status-dot.error{background:var(--danger)}.status-dot.docked{background:#47a760}.battery{text-align:right;min-width:90px}.battery>span{color:var(--accent)}.battery strong{font-size:30px}.battery small{font-weight:700}.battery-track{width:88px;height:5px;background:var(--line);border-radius:4px;margin-top:6px;overflow:hidden}.battery-track i{display:block;height:100%;background:linear-gradient(90deg,var(--accent-2),var(--accent));border-radius:4px}nav{display:flex;padding:0 26px;border-bottom:1px solid var(--line);gap:22px}.nav-button{border:0;background:none;padding:17px 3px 14px;color:var(--muted);font-weight:700;cursor:pointer;border-bottom:3px solid transparent}.nav-button.active{color:var(--accent);border-color:var(--accent)}main{padding:26px;background:color-mix(in srgb,var(--surface) 97%,var(--ink))}.actions{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px}.action{border:1px solid var(--line);background:var(--surface);border-radius:17px;padding:13px 8px;display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;transition:.18s}.action:hover{transform:translateY(-2px);border-color:color-mix(in srgb,var(--accent) 50%,var(--line));box-shadow:0 8px 20px color-mix(in srgb,var(--ink) 8%,transparent)}.action span{color:var(--accent);font-size:18px}.action.primary{background:var(--accent);color:white;border-color:var(--accent)}.action.primary span{color:white}.dashboard-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.65fr);gap:18px}.dashboard-grid.without-map{grid-template-columns:1fr}.panel{background:var(--surface);border:1px solid var(--line);border-radius:22px;padding:20px;min-width:0}.panel-heading{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.panel-heading h2{font-size:19px;margin-top:2px}.text-button{border:0;background:var(--soft);color:var(--accent);padding:7px 11px;border-radius:10px;cursor:pointer;font-weight:700}.map-panel{min-height:410px;display:flex;flex-direction:column}.map-stage{position:relative;min-height:390px;overflow:hidden;border-radius:17px;border:1px solid var(--line);background-color:#fbfcfd;background-image:linear-gradient(rgba(64,116,150,.075) 1px,transparent 1px),linear-gradient(90deg,rgba(64,116,150,.075) 1px,transparent 1px),linear-gradient(rgba(64,116,150,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(64,116,150,.035) 1px,transparent 1px);background-size:24px 24px,24px 24px,6px 6px,6px 6px}.map{width:100%;height:100%;min-height:390px;object-fit:contain;padding:70px 16px 12px;filter:drop-shadow(0 4px 6px rgba(24,88,128,.14));mix-blend-mode:multiply}.session-card{position:absolute;z-index:2;top:14px;left:14px;right:14px;padding:11px 14px;border-radius:14px;background:color-mix(in srgb,var(--surface) 94%,transparent);box-shadow:0 8px 24px rgba(25,57,75,.12);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:space-between;gap:12px}.session-card>span{font-weight:750}.session-card>div{display:flex;gap:16px;color:#0877bd}.session-card b{font-size:14px}.map-empty{min-height:390px;background:transparent}.cleaning-console{padding-top:14px}.mode-tabs{display:grid;grid-template-columns:repeat(3,1fr);border-bottom:1px solid var(--line)}.mode-tabs button{border:0;background:none;padding:11px;color:var(--muted);font-weight:650;cursor:pointer;border-bottom:3px solid transparent}.mode-tabs button.active{color:var(--accent-2);border-color:var(--accent-2)}.target-content{padding:12px 0;min-height:56px}.target-grid{display:flex;gap:8px;overflow:auto;padding:2px}.target-chip{flex:0 0 auto;border:1px solid var(--line);background:var(--surface);border-radius:13px;padding:9px 12px;display:flex;align-items:center;gap:7px;cursor:pointer}.target-chip ha-icon{color:var(--accent-2)}.target-chip.selected{border-color:var(--accent-2);background:color-mix(in srgb,var(--accent-2) 12%,var(--surface));color:var(--accent-2)}.target-help{font-size:12px;color:var(--muted);padding:7px 2px}.clean-start{width:100%;border:0;border-radius:16px;padding:13px;background:var(--accent-2);color:white;font-weight:750;display:flex;align-items:center;justify-content:center;gap:9px;cursor:pointer;box-shadow:0 8px 20px color-mix(in srgb,var(--accent-2) 25%,transparent)}.clean-start:disabled{opacity:.45;box-shadow:none;cursor:not-allowed}.empty{flex:1;min-height:290px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:var(--muted);gap:8px;background:var(--soft);border-radius:14px}.empty ha-icon{--mdc-icon-size:48px;color:var(--accent)}.empty span{font-size:13px;max-width:260px}.empty.compact{min-height:110px}.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.metric{background:var(--soft);padding:13px;border-radius:14px;display:flex;gap:10px;align-items:center}.metric-icon{width:32px;height:32px;display:grid;place-items:center;border-radius:10px;background:var(--surface);color:var(--accent);font-weight:800}.metric small,.total small,.life small{display:block;color:var(--muted);font-size:11px}.metric strong{display:block;margin-top:2px;font-size:14px}.control-list{margin-top:14px;display:grid;gap:8px}.control-list label{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:700}.control-list select{max-width:58%;border:1px solid var(--line);border-radius:10px;padding:7px;background:var(--surface)}.totals,.maintenance{margin-top:18px}.total-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.total{display:flex;align-items:center;gap:12px;padding:14px;border-radius:15px;background:var(--soft)}.total ha-icon{color:var(--accent)}.total strong{font-size:16px}.maintenance-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.life{text-align:center}.life>strong{display:block;margin-top:9px}.ring{--value:0;width:92px;height:92px;margin:auto;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--ring) calc(var(--value)*1%),var(--line) 0);position:relative}.ring:before{content:"";position:absolute;inset:8px;border-radius:50%;background:var(--surface)}.ring span{position:relative;font-size:18px;font-weight:800}.alert{display:flex;gap:12px;align-items:center;background:color-mix(in srgb,var(--danger) 12%,var(--surface));border:1px solid color-mix(in srgb,var(--danger) 35%,transparent);border-radius:16px;padding:14px;margin-bottom:16px;color:var(--danger)}.alert div span{display:block;font-size:12px;margin-top:2px}.entity-list,.switch-list{display:grid}.entity-row,.switch-row{width:100%;border:0;border-bottom:1px solid var(--line);background:none;padding:13px 4px;display:flex;align-items:center;gap:12px;text-align:left;cursor:pointer}.entity-row:hover,.switch-row:hover{background:var(--soft)}.entity-row ha-icon,.switch-row ha-icon{color:var(--accent)}.entity-row>span{flex:1;min-width:0}.entity-row strong,.entity-row small{display:block;overflow:hidden;text-overflow:ellipsis}.entity-row small{color:var(--muted);font-size:10px;margin-top:2px}.entity-row>b{max-width:35%;text-align:right;font-size:12px}.count{font-size:11px;color:var(--muted)}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.switch-row span{flex:1;font-weight:650}.toggle{width:38px;height:22px;border-radius:12px;background:var(--line);position:relative}.toggle:after{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:var(--surface);transition:.2s}.toggle.on{background:var(--accent)}.toggle.on:after{left:19px}.config-summary p{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:11px 0;font-size:12px}.config-summary strong{text-align:right;word-break:break-all}.hint{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.5}footer{text-align:center;color:var(--muted);font-size:10px;padding:14px;border-top:1px solid var(--line)}.missing{padding:30px;color:var(--danger)}@keyframes rvdPulse{50%{box-shadow:0 0 0 10px color-mix(in srgb,var(--accent) 10%,transparent),0 12px 30px color-mix(in srgb,var(--ink) 14%,transparent)}}
-      .dashboard-grid{grid-template-columns:1fr}.map-panel{padding:0;overflow:hidden;border-radius:26px}.map-heading{padding:20px 22px 0;margin-bottom:14px}.map-detail{width:42px;height:42px;border:0;border-radius:50%;display:grid;place-items:center;background:var(--soft);color:var(--accent-2);cursor:pointer}.map-stage{border-width:1px 0;border-radius:0;min-height:520px}.map{min-height:520px;padding:84px 18px 18px}.map-panel.is-cleaning{box-shadow:0 12px 36px color-mix(in srgb,var(--accent-2) 16%,transparent)}.session-card{top:18px;left:18px;right:18px;padding:13px 16px;border-radius:17px}.session-state{align-items:center;color:var(--ink)!important;font-weight:800}.session-state i{width:9px;height:9px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 5px color-mix(in srgb,var(--accent-2) 14%,transparent)}.session-card b{display:flex;align-items:center;gap:5px}.session-card ha-icon{--mdc-icon-size:18px}.cleaning-console{padding:0 22px 22px;background:var(--surface)}.mode-tabs{max-width:460px;margin:auto;border:0}.mode-tabs button{font-size:16px;padding:17px 12px 12px}.target-content{min-height:70px;display:flex;align-items:center}.target-grid{width:100%;padding:4px 2px 8px}.target-chip{border-radius:18px;padding:10px 14px;box-shadow:0 4px 12px color-mix(in srgb,var(--ink) 7%,transparent)}.clean-action{display:flex;flex-direction:column;align-items:center;gap:8px;padding-top:2px}.clean-action>span{font-size:12px;font-weight:750;color:var(--muted)}.clean-start{width:82px;height:82px;padding:0;border-radius:50%;background:linear-gradient(145deg,#3298ea,var(--accent-2));box-shadow:0 12px 28px color-mix(in srgb,var(--accent-2) 35%,transparent),inset 0 0 0 5px rgba(255,255,255,.25)}.clean-start ha-icon{--mdc-icon-size:38px}.stats-panel{margin-top:0}.is-cleaning .session-state i{animation:rvdLive 1.4s infinite}@keyframes rvdLive{50%{opacity:.45;transform:scale(.8)}}
+      .dashboard-grid{grid-template-columns:1fr}.map-panel{padding:0;overflow:hidden;border-radius:26px}.map-heading{padding:20px 22px 0;margin-bottom:14px}.map-detail{width:42px;height:42px;border:0;border-radius:50%;display:grid;place-items:center;background:var(--soft);color:var(--accent-2);cursor:pointer}.map-stage{border-width:1px 0;border-radius:0;min-height:520px}.map{min-height:520px;padding:84px 18px 18px}.map-panel.is-cleaning{box-shadow:0 12px 36px color-mix(in srgb,var(--accent-2) 16%,transparent)}.session-card{top:18px;left:18px;right:18px;padding:13px 16px;border-radius:17px}.session-state{align-items:center;color:var(--ink)!important;font-weight:800}.session-state i{width:9px;height:9px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 5px color-mix(in srgb,var(--accent-2) 14%,transparent)}.session-card b{display:flex;align-items:center;gap:5px}.session-card ha-icon{--mdc-icon-size:18px}.cleaning-console{padding:0 22px 22px;background:var(--surface)}.mode-tabs{max-width:460px;margin:auto;border:0}.mode-tabs button{font-size:16px;padding:17px 12px 12px}.target-content{min-height:70px;display:flex;align-items:center}.target-grid{width:100%;padding:4px 2px 8px}.target-chip{border-radius:18px;padding:10px 14px;box-shadow:0 4px 12px color-mix(in srgb,var(--ink) 7%,transparent)}.clean-action{display:flex;flex-direction:column;align-items:center;gap:8px;padding-top:2px}.clean-action>span{font-size:12px;font-weight:750;color:var(--muted)}.clean-start{width:82px;height:82px;padding:0;border-radius:50%;background:linear-gradient(145deg,#3298ea,var(--accent-2));box-shadow:0 12px 28px color-mix(in srgb,var(--accent-2) 35%,transparent),inset 0 0 0 5px rgba(255,255,255,.25)}.clean-start ha-icon{--mdc-icon-size:38px}.stats-panel{margin-top:0}.is-cleaning .session-state i{animation:rvdLive 1.4s infinite}@keyframes rvdLive{50%{opacity:.45;transform:scale(.8)}} @media(prefers-reduced-motion:reduce){:host *,:host *::before,:host *::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
       .map-visual{position:absolute;inset:0;padding:84px 18px 18px}.map-visual .map{display:block;width:100%;height:100%;min-height:0;padding:0;object-fit:contain;opacity:.86;filter:saturate(.82) contrast(.96);mix-blend-mode:normal}.room-overlay{position:absolute;inset:84px 18px 18px;width:calc(100% - 36px);height:calc(100% - 102px);z-index:1}.room-shape{fill-opacity:.22;stroke:rgba(54,101,132,.58);stroke-width:.8;vector-effect:non-scaling-stroke;cursor:pointer;transition:fill-opacity .18s,filter .18s}.room-shape:hover{fill-opacity:.34;filter:brightness(1.04)}.room-shape.selected{fill-opacity:.46;stroke:var(--accent-2);stroke-width:2;filter:saturate(1.12)}.room-shape[data-map-area-id=""]{pointer-events:none;fill-opacity:.1}.room-label{font:650 4.8px system-ui,sans-serif;fill:#243746;text-anchor:middle;dominant-baseline:middle;paint-order:stroke;stroke:rgba(255,255,255,.94);stroke-width:1.25px;stroke-linejoin:round;pointer-events:none}
       .map-native{position:absolute;inset:0;padding:84px 18px 18px}.map-native>.rvd-native-svg{display:block;width:100%;height:100%;overflow:visible}.rvd-room-fill{fill-opacity:.86;stroke:rgba(54,101,132,.72);stroke-width:.9;vector-effect:non-scaling-stroke;pointer-events:none}.rvd-room-fill.selected{fill-opacity:.96;stroke:var(--accent-2);stroke-width:2}.rvd-room-hit{fill:transparent;stroke:transparent;stroke-width:1.5;vector-effect:non-scaling-stroke;pointer-events:all;cursor:pointer}.rvd-room-hit:hover{fill:color-mix(in srgb,var(--accent-2) 10%,transparent);stroke:color-mix(in srgb,var(--accent-2) 65%,transparent)}.rvd-room-hit[data-map-area-id=""]{pointer-events:none}.rvd-room-label{font-weight:750}
       ha-card{display:block;width:100%;max-width:1440px;margin-inline:auto}
@@ -1196,6 +1256,8 @@ class RobotVacuumDashboardCardEditor extends HTMLElement {
     this._formSupport = undefined;
     this._fallbackSignature = null;
   }
+
+  connectedCallback() { this._update(); }
 
   setConfig(config) {
     this.config = { entities: {}, ...config };

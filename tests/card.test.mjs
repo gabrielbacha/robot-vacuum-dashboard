@@ -1,6 +1,6 @@
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { readFileSync } from "node:fs";
-import { test, before, after } from "node:test";
+import { test, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 const SOURCE = readFileSync(new URL("../robot-vacuum-dashboard.js", import.meta.url), "utf8");
@@ -15,6 +15,8 @@ before(async () => {
   await import("../robot-vacuum-dashboard.js");
   Card = customElements.get("robot-vacuum-dashboard-card");
 });
+
+afterEach(() => { document.body.replaceChildren(); });
 
 after(async () => {
   await GlobalRegistrator.unregister();
@@ -46,13 +48,13 @@ const deebotHass = (overrides = {}) => {
     "sensor.deebot_ga_total_area_cleaned": entry("sensor.deebot_ga_total_area_cleaned", "total_stats_area"),
     "sensor.deebot_ga_main_brush_lifespan": entry("sensor.deebot_ga_main_brush_lifespan", "lifespan_brush"),
     "select.deebot_ga_water_flow_level": entry("select.deebot_ga_water_flow_level", "water_amount"),
-    "sensor.ecovacs_map_data_map_geometry": entry("sensor.ecovacs_map_data_map_geometry", "map_geometry", "ecovacs_map_data", "dev-other"),
+    "sensor.ecovacs_map_data_map_geometry": entry("sensor.ecovacs_map_data_map_geometry", "map_geometry", "ecovacs_map_data", "dev-map"),
     "light.unrelated": entry("light.unrelated", null, "hue", "dev-light"),
   };
   return {
     states,
     entities,
-    devices: { "dev-deebot": { id: "dev-deebot", manufacturer: "Ecovacs", model: "DEEBOT T8+" } },
+    devices: { "dev-deebot": { id: "dev-deebot", manufacturer: "Ecovacs", model: "DEEBOT T8+", identifiers: [["ecovacs", "synthetic-1"]] }, "dev-map": { id: "dev-map", identifiers: [["ecovacs", "synthetic-1"]] } },
     areas: { kitchen: { area_id: "kitchen", name: "Kitchen" }, living_room: { area_id: "living_room", name: "Living room" } },
     language: "en",
     hassUrl: (url) => url,
@@ -109,12 +111,12 @@ test("an explicit entity mapping wins over detection", async () => {
   assert.equal(card._entity("cleaning_area"), "sensor.deebot_ga_total_area_cleaned");
 });
 
-test("without an entity registry, names are still matched", async () => {
+test("without device proof automatic names are refused", async () => {
   const hass = deebotHass();
   delete hass.entities;
   const card = await mount({}, hass);
-  assert.equal(card._entity("cleaning_area"), "sensor.deebot_ga_area_cleaned");
-  assert.equal(card._entity("total_time"), "sensor.deebot_ga_total_cleaning_duration");
+  assert.equal(card._entity("cleaning_area"), null);
+  assert.equal(card._entity("total_time"), null);
 });
 
 test("unrelated state changes do not re-render; vacuum changes do", async () => {
@@ -273,3 +275,84 @@ test("the ha-form editor is created once and only receives new data", async () =
   assert.deepEqual(config.entities, { error: "sensor.x" });
   assert.equal(config.cleaning_areas_text, undefined);
 });
+
+const withMap = () => {
+  const hass=deebotHass();
+  hass.states['image.synthetic']=state('image.synthetic','revision-1',{entity_picture:'/synthetic-map'});
+  hass.entities['image.synthetic']={entity_id:'image.synthetic',device_id:'dev-deebot',translation_key:'map'};
+  return hass;
+};
+const response = (type='image/svg+xml',body='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0L10 10"/></svg>') => ({ok:true,headers:{get:key=>key==='content-type'?type:null},text:async()=>body});
+
+test('hidden and forced image maps make no metadata requests',async()=>{
+  let requests=0;globalThis.fetch=async()=>{requests++;return response();};
+  await mount({show_map:false,entities:{map:'image.synthetic'}},withMap());
+  await mount({map_render_mode:'image',entities:{map:'image.synthetic'}},withMap());
+  assert.equal(requests,0);
+});
+test('failed and raster map revisions do not loop on rerender',async()=>{
+  for(const raster of [false,true]){
+    let requests=0;globalThis.fetch=async()=>{requests++;if(!raster)throw Error('synthetic refusal');return response('image/png');};
+    const card=await mount({entities:{map:'image.synthetic'}},withMap());await flush();await flush();
+    for(let i=0;i<10;i++)card._render();await flush();assert.equal(requests,1);card.remove();
+  }
+});
+test('map retrieval retries at most three times per exact key',async()=>{
+  let requests=0;globalThis.fetch=async()=>{requests++;throw Error('synthetic failure');};
+  const card=await mount({entities:{map:'image.synthetic'}},withMap());
+  for(let i=0;i<6;i++){await flush();clearTimeout(card._mapRetryTimer);card._mapRetryTimer=null;for(const item of card._mapAttempts.values())item.readyRetry=true;card._render();}
+  await flush();assert.equal(requests,3);
+});
+test('map cache distinguishes entities with identical URL and revision',async()=>{
+  let requests=0;globalThis.fetch=async()=>{requests++;return response();};const hass=withMap();
+  hass.states['image.other']=state('image.other','revision-1',{entity_picture:'/synthetic-map'});hass.entities['image.other']={device_id:'dev-deebot'};
+  const card=await mount({entities:{map:'image.synthetic'}},hass);await flush();
+  card.setConfig({entity:'vacuum.deebot_ga',entities:{map:'image.other'}});await flush();await flush();assert.equal(requests,2);
+});
+test('cancelled stale map responses cannot install metadata',async()=>{
+  let finish;globalThis.fetch=()=>new Promise(resolve=>finish=resolve);
+  const card=await mount({entities:{map:'image.synthetic'}},withMap());const signal=card._mapActive.controller.signal;
+  card.setConfig({entity:'vacuum.deebot_ga',show_map:false});assert.equal(signal.aborted,true);
+  finish(response());await flush();await flush();assert.equal(card._mapMetadata,null);
+});
+test('map timeout aborts and oversized responses are refused',async()=>{
+  globalThis.fetch=()=>new Promise(()=>{});const card=await mount({entities:{map:'image.synthetic'}},withMap());const request=card._mapActive;
+  request.controller.abort();request.rejectTimeout(Error('synthetic timeout'));await flush();await flush();assert.equal([...card._mapAttempts.values()][0].status,'failed');
+  await assert.rejects(card._readMapText({headers:{get:()=> '2097153'}},new AbortController().signal),/size limit/);
+  await assert.rejects(card._readMapText(response('image/svg+xml','x'.repeat(2097153)),new AbortController().signal),/size limit/);
+});
+test('missing, foreign and ambiguous sensor mappings refuse fallback',async()=>{
+  const hass=deebotHass();hass.states['sensor.foreign']=state('sensor.foreign',99);hass.entities['sensor.foreign']={device_id:'foreign',translation_key:'stats_area'};
+  for(const id of ['sensor.missing','sensor.foreign']){const card=await mount({entities:{cleaning_area:id}},hass);assert.equal(card._entity('cleaning_area'),null);assert.ok(card.shadowRoot.querySelector('[role="alert"]'));}
+  hass.states['sensor.duplicate']=state('sensor.duplicate',4);hass.entities['sensor.duplicate']={device_id:'dev-deebot',translation_key:'stats_area'};
+  const card=await mount({},hass);assert.equal(card._entity('cleaning_area'),null);
+});
+test('short vacuum names never match all household entities',async()=>{
+  const hass=deebotHass();hass.states['vacuum.x']=state('vacuum.x','docked',{friendly_name:'X'});hass.entities['vacuum.x']={device_id:'dev-x'};
+  const card=await mount({entity:'vacuum.x'},hass);assert.equal(card._entity('water_level'),null);assert.equal(card._entity('map_geometry'),null);
+});
+test('vacuum and geometry changes clear selected rooms and zones',async()=>{
+  const hass=deebotHass();const card=await mount({},hass);card._selectedAreas.add('1');card._selectedRegion=0;
+  card.hass={...hass,states:{...hass.states,'sensor.ecovacs_map_data_map_geometry':state('sensor.ecovacs_map_data_map_geometry',3,{schema_version:2,rooms:[]})}};
+  assert.equal(card._selectedAreas.size,0);assert.equal(card._selectedRegion,null);
+  card._selectedAreas.add('1');card.setConfig({entity:'vacuum.missing'});assert.equal(card._selectedAreas.size,0);
+});
+test('All data refreshes extra device rows and keeps tab focus',async()=>{
+  const hass=deebotHass();hass.states['sensor.extra']=state('sensor.extra',1);hass.entities['sensor.extra']={device_id:'dev-deebot'};
+  const card=await mount({},hass);const button=card.shadowRoot.querySelector('[data-tab="details"]');button.focus();button.click();
+  assert.equal(card.shadowRoot.activeElement.dataset.tab,'details');assert.match(text(card),/sensor.extra/);
+  card.hass={...hass,states:{...hass.states,'sensor.extra':state('sensor.extra',42)}};await flush();assert.match(text(card),/42/);assert.equal(card.shadowRoot.activeElement.dataset.tab,'details');
+  const active=card.shadowRoot.activeElement;active.dispatchEvent(new KeyboardEvent('keydown',{key:'Home',bubbles:true}));assert.equal(card._tab,'overview');assert.equal(card.shadowRoot.activeElement.dataset.tab,'overview');
+  const tab=card.shadowRoot.activeElement;assert.ok(card.shadowRoot.getElementById(tab.getAttribute('aria-controls')));assert.equal(tab.tabIndex,0);
+});
+test('cleaning mode tabs have keyboard navigation and panel relations',async()=>{
+  const card=await mount();const tab=card.shadowRoot.querySelector('[data-clean-mode="auto"]');tab.focus();tab.dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}));
+  assert.equal(card._cleanMode,'custom');assert.equal(card.shadowRoot.activeElement.dataset.cleanMode,'custom');assert.ok(card.shadowRoot.getElementById(card.shadowRoot.activeElement.getAttribute('aria-controls')));
+});
+test('reduced motion CSS disables both cleaning pulses',()=>{assert.match(SOURCE,/prefers-reduced-motion:reduce/);assert.match(SOURCE,/animation:none!important/);});
+
+test('404 and malformed SVG wait for scheduled retry',async()=>{for(const responseValue of [{ok:false,status:404},response('image/svg+xml','<html>not a map</html>')]){let requests=0;globalThis.fetch=async()=>{requests++;return responseValue;};const card=await mount({entities:{map:'image.synthetic'}},withMap());await flush();await flush();for(let i=0;i<8;i++)card._render();await flush();assert.equal(requests,1);assert.equal([...card._mapAttempts.values()][0].status,'failed');card.remove();}});
+
+test('in-place registry changes revoke old controls before deferred render',async()=>{const hass=deebotHass();const calls=[];hass.callService=async(...args)=>calls.push(args);const card=await mount({},hass);const select=card.shadowRoot.querySelector('select[data-entity="select.deebot_ga_water_flow_level"]');select.focus();hass.entities['select.deebot_ga_water_flow_level'].device_id='foreign';card.hass=hass;assert.equal(card._entity('water_level'),null);select.dispatchEvent(new Event('change',{bubbles:true}));await flush();assert.equal(calls.length,0);});
+
+test('retained native-map nodes get one keyboard/click handler per render',async()=>{globalThis.fetch=async()=>response('image/svg+xml','<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 100"><rect width="180" height="100"/></svg>');const card=await mount({entities:{map:'image.synthetic'},cleaning_areas:[{id:'kitchen',name:'Kitchen',segments:['1']}]},withMap());await flush();await flush();for(let i=0;i<5;i++)card._render();let area=card.shadowRoot.querySelector('[data-map-area-id="kitchen"][role="button"]');area.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));assert.deepEqual([...card._selectedAreas],['kitchen']);for(let i=0;i<5;i++)card._render();area=card.shadowRoot.querySelector('[data-map-area-id="kitchen"][role="button"]');area.dispatchEvent(new MouseEvent('click',{bubbles:true}));assert.equal(card._selectedAreas.size,0);});

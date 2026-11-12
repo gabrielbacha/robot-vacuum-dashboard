@@ -70,7 +70,7 @@ entity: vacuum.deebot_n8_plus
 name: DEEBOT N8+
 ```
 
-De kaart zoekt automatisch naar entiteiten waarvan de object-id of zichtbare naam overeenkomt met de gekozen robot. Controleer na de eerste keer openen of de kaart, statistieken en instellingen correct zijn herkend.
+Automatic detection is limited to the selected vacuum’s registered device. A companion device must share an exact registered identifier. Names are used only within those verified devices. Missing, foreign or ambiguous mappings show an error and do not select another device. A helper without registry identity can be mapped explicitly; confirm that it belongs to this vacuum. Changing the vacuum or map clears selected rooms and zones.
 
 ## Interactieve Ecovacs-kaart
 
@@ -198,3 +198,9 @@ npm test
 ## Licentie
 
 [MIT](LICENSE)
+
+## Map requests and keyboard use
+
+Hidden maps and forced image mode do not request SVG metadata. Metadata requests use the entity, URL and revision as the cache key. Raster images are terminal results. Failed requests wait for a scheduled retry, with at most three attempts per key, a five-second request limit and a 2 MiB SVG limit. Changing the configuration or removing the card cancels pending work.
+
+The main and cleaning-mode tabs support Left, Right, Home and End. Live updates restore button and tab focus. All data includes changes to every verified device entity that it displays. Reduced motion disables cleaning pulses.
